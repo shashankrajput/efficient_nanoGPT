@@ -50,17 +50,11 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
         
         per_head_dim = self.n_embd // self.n_head
-        self.proj_half = torch.normal(torch.zeros(2*per_head_dim, per_head_dim), torch.ones(per_head_dim, per_head_dim//2)/math.sqrt(per_head_dim//2)).cuda()
-        self.proj_half.requires_grad = False
-        if config.bias:
-            self.proj_half_bias = self.c_attn.bias@self.proj_half
-            self.v_mid_bias = self.c_attn.bias[-config.n_embd:]
-        else:
-            self.proj_half_bias = self.c_attn.bias
-            self.v_mid_bias = self.c_attn.bias
-        self.proj_half = self.c_attn.weight[:,:2*per_head_dim]@self.proj_half
+        
+        self.q_proj = torch.normal(torch.zeros(per_head_dim, per_head_dim//2)).cuda()/math.sqrt(per_head_dim//2)
+        self.q_proj.requires_grad = False
 
-    def forward(self, x, att_cache=None, full_precision_att=True):
+    def forward(self, x, att_cache=None, use_att_caching=True, full_precision_att=True):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -72,27 +66,22 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         else:
-            # TODO: k can also be cached
+            # x_rolled = torch.roll(x, shifts=-32, dim=1)
 
-            q = torch.empty(B, self.n_head, T, C // self.n_head)
-            k = torch.empty(B, self.n_head, T, C // self.n_head)
-            v = torch.empty(B, self.n_head, T, C // self.n_head)
+            # q_full_prec, k_full_prec, v_full_prec  = self.c_attn(x_rolled[:, 832:, :]).split(self.n_embd, dim=2)
+            
+            q_last_tok, k_last_tok, v_last_tok  = self.c_attn(x[:,-1:,:]).split(self.n_embd, dim=2)
+            k_last_tok = k_last_tok.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 1, hs)
+            q_last_tok = q_last_tok.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 1, hs)
+            v_last_tok = v_last_tok.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 1, hs)
 
-            q_beg, k_beg, v_beg  = self.c_attn(x[:,:32,:]).split(self.n_embd, dim=2)
-            k[:,:,:32,:] = k_beg.view(B, 32, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q[:,:,:32,:] = q_beg.view(B, 32, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v[:,:,:32,:] = v_beg.view(B, 32, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-            q_end, k_end, v_end  = self.c_attn(x[:,864:,:]).split(self.n_embd, dim=2)
-            k[:,:,864:,:] = k_end.view(B, 160, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q[:,:,864:,:] = q_end.view(B, 160, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v[:,:,864:,:] = v_end.view(B, 160, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            
+            k = torch.cat((att_cache['k'].cuda(), k_last_tok), dim=-2)
+            v = torch.cat((att_cache['v'].cuda(), v_last_tok), dim=-2)
 
-            q_mid, k_mid, v_mid  = torch.nn.functional.linear(x[:,32:864,:], self.proj_half, self.proj_half_bias).split(self.n_embd, dim=2)
-            v_mid  = torch.nn.functional.linear(x[:,32:864,:], self.c_attn.weight[:,-config.n_embd:], self.v_mid_bias)
-            k[:,:,32:864,:] = k_mid.view(B, 160, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q[:,:,32:864,:] = q_mid.view(B, 160, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v[:,:,32:864,:] = v_mid.view(B, 160, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+
 
             
 
@@ -110,28 +99,31 @@ class CausalSelfAttention(nn.Module):
                 att = self.attn_dropout(att)
             else:
                 
-                att = torch.nn.functional.pad(att_cache, pad=(0,1))
-                att = att/torch.unsqueeze(torch.sum(att, dim=-1), dim=-1)
-                att = torch.nn.functional.pad(att, pad=(0,0,0,1))
+                # att = torch.nn.functional.pad(att_cache['att'].cuda(), pad=(0,1,0,1))
 
                 if full_precision_att:
-                    last_tok_att = (q[...,-1:,:]@ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                    last_tok_att = (q_last_tok@ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
                 else:
                     last_tok_att = torch.empty(q.shape[:-2]+(1,k.shape[-2]))
+                    assert False
+                    
 
-                    last_tok_att[..., :32] = (q[...,-1:,:]@ k.transpose(-2, -1)[..., :32]) * (1.0 / math.sqrt(k.size(-1)))
-                    last_tok_att[..., 864:] = (q[...,-1:,:]@ k.transpose(-2, -1)[..., 864:]) * (1.0 / math.sqrt(k.size(-1)))
-                    last_tok_att[..., 32:864] = (q[...,-1:,:]@ k.transpose(-2, -1)[..., 32:864]) * (1.0 / math.sqrt(k.size(-1)))
-
-                last_tok_att = F.softmax(last_tok_att, dim=-1)
-                att[...,-1:,:]=last_tok_att
+                # last_tok_att = torch.exp(last_tok_att)
+                # att[...,-1:,:]=last_tok_att
+                # att = att/torch.unsqueeze(torch.sum(att, dim=-1), dim=-1)
+                att = F.softmax(last_tok_att, dim=-1)
+                att = self.attn_dropout(att)
 
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y, att[..., 1:,1:]
+        if use_att_caching
+            # return y, {'att': att[..., 1:,1:].cpu(), 'v': v[..., 1:, :].cpu(), 'k': k[..., 1:, :].cpu()}
+            return y, {'v': v[..., 1:, :].cpu(), 'k': k[..., 1:, :].cpu()}
+        else:
+            return y, None
 
 class MLP(nn.Module):
 
@@ -158,8 +150,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, att_cache=None):
-        attn_output, new_att_cache = self.attn(self.ln_1(x), att_cache=att_cache)
+    def forward(self, x, att_cache=None, use_att_caching=True):
+        attn_output, new_att_cache = self.attn(self.ln_1(x), att_cache=att_cache, use_att_caching=use_att_caching)
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
         return x, new_att_cache
@@ -226,24 +218,36 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, att_cache_list=None):
+    def forward(self, idx, targets=None, att_cache_list=None, use_att_caching=True):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        
+        if att_cache_list is not None:
+            pos = torch.arange(self.config.block_size-1, self.config.block_size, dtype=torch.long, device=device) # shape (t)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        
+        
+        
         x = self.transformer.drop(tok_emb + pos_emb)
 
-        att_cache_list_new = []
+        att_cache_list_new = None
+        if use_att_caching:
+            att_cache_list_new = []
         for block_index, block in enumerate(self.transformer.h):
             if att_cache_list is None:
-                x, att_cache = block(x, att_cache=None)
+                x, att_cache = block(x, att_cache=None, use_att_caching=use_att_caching)
             else:
-                x, att_cache = block(x, att_cache=att_cache_list[block_index].cuda())
-            att_cache_list_new.append(att_cache.cpu())
+                x, att_cache = block(x, att_cache=att_cache_list[block_index], use_att_caching=use_att_caching)
+            
+            if use_att_caching:
+                att_cache_list_new.append(att_cache)
         
         x = self.transformer.ln_f(x)
 
@@ -369,18 +373,20 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_att_caching=True):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        if use_att_caching:
+            assert idx.size(1) >= self.config.block_size
         att_cache_list = None
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _, att_cache_list = self(idx_cond, att_cache_list=att_cache_list)
+            logits, _, att_cache_list = self(idx_cond, att_cache_list=att_cache_list, use_att_caching=use_att_caching)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -392,6 +398,11 @@ class GPT(nn.Module):
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            
+            
+            if use_att_caching:
+                idx = idx_next
+            else:
+                idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
