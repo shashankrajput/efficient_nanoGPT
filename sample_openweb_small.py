@@ -90,12 +90,13 @@ with torch.no_grad():
 
             if len(start_ids)<model.config.block_size:
                 continue
+            print(useful_samples)
             useful_samples+=1
             start_ids=start_ids[-model.config.block_size:]
             x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
     
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(useful_samples)    
-            print(decode(y[0].tolist()))
-            print('---------------')
+            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, decode=decode)
+                
+            # print(decode(y[0].tolist()))
+            # print('---------------')

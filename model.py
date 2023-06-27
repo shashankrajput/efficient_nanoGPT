@@ -51,10 +51,10 @@ class CausalSelfAttention(nn.Module):
         
         per_head_dim = self.n_embd // self.n_head
         
-        self.q_proj = torch.normal(torch.zeros(per_head_dim, per_head_dim//2)).cuda()/math.sqrt(per_head_dim//2)
-        self.q_proj.requires_grad = False
+        self.proj_matrix = torch.normal(torch.zeros(per_head_dim, per_head_dim//2)).cuda()/math.sqrt(per_head_dim//2)
+        self.proj_matrix.requires_grad = False
 
-    def forward(self, x, att_cache=None, use_att_caching=True, full_precision_att=True):
+    def forward(self, x, att_cache=None, use_att_caching=True, full_precision_att=False):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -65,20 +65,24 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        else:
-            # x_rolled = torch.roll(x, shifts=-32, dim=1)
+            k_proj = k @ self.proj_matrix
 
-            # q_full_prec, k_full_prec, v_full_prec  = self.c_attn(x_rolled[:, 832:, :]).split(self.n_embd, dim=2)
+        else:
+            
+
             
             q_last_tok, k_last_tok, v_last_tok  = self.c_attn(x[:,-1:,:]).split(self.n_embd, dim=2)
             k_last_tok = k_last_tok.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 1, hs)
             q_last_tok = q_last_tok.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 1, hs)
             v_last_tok = v_last_tok.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, 1, hs)
 
-
+            q_last_tok_proj = q_last_tok @ self.proj_matrix
+            k_last_tok_proj = k_last_tok @ self.proj_matrix
             
             k = torch.cat((att_cache['k'].cuda(), k_last_tok), dim=-2)
             v = torch.cat((att_cache['v'].cuda(), v_last_tok), dim=-2)
+
+            k_proj = torch.cat((att_cache['k_proj'].cuda(), k_last_tok_proj), dim=-2)
 
 
 
@@ -97,31 +101,48 @@ class CausalSelfAttention(nn.Module):
                 att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
                 att = F.softmax(att, dim=-1)
                 att = self.attn_dropout(att)
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+                y_true = y
             else:
-                
-                # att = torch.nn.functional.pad(att_cache['att'].cuda(), pad=(0,1,0,1))
-
                 if full_precision_att:
                     last_tok_att = (q_last_tok@ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
                 else:
-                    last_tok_att = torch.empty(q.shape[:-2]+(1,k.shape[-2]))
-                    assert False
+                    last_tok_att = torch.empty(q_last_tok.shape[:-2]+(1,k.shape[-2])).cuda()
+                    k_rolled = torch.roll(k, shifts=-32, dims=-2)[...,832:,:]
+                    k_proj_rolled = torch.roll(k_proj, shifts=-32, dims=-2)[...,:832,:]
+                    
+                    last_tok_att[...,832:] = (q_last_tok@ k_rolled.transpose(-2, -1)) * (1.0 / math.sqrt(k_rolled.size(-1)))
+                    last_tok_att[...,:832] = (q_last_tok_proj@ k_proj_rolled.transpose(-2, -1)) * (1.0 / math.sqrt(k_rolled.size(-1)))
+                    last_tok_att = torch.roll(last_tok_att, shifts=32, dims=-1)
                     
 
-                # last_tok_att = torch.exp(last_tok_att)
-                # att[...,-1:,:]=last_tok_att
-                # att = att/torch.unsqueeze(torch.sum(att, dim=-1), dim=-1)
                 att = F.softmax(last_tok_att, dim=-1)
                 att = self.attn_dropout(att)
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+                ###### Only for debugging ######
+                last_tok_att_true = (q_last_tok@ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att_true = F.softmax(last_tok_att_true, dim=-1)
+                y_true = att_true @ v
+                att_error = torch.mean(torch.norm(att_true - att, dim=-1)).item()
+                # y_error = torch.mean(torch.norm(y_true - y, dim=-1)/ torch.norm(y_true, dim=-1)).item()
+                y_cosine = torch.mean(torch.nn.functional.cosine_similarity(y_true, y, dim=-1)).item()
+                
+                y_norm = torch.mean(torch.norm(y, dim=-1)).item()
+                y_true_norm = torch.mean(torch.norm(y_true, dim=-1)).item()
+                # print('att_error: ', att_error)
+                # print('y_cosine: ', y_cosine)
+                # print('y_norm: ', y_norm)
+                # print('y_true_norm: ', y_true_norm)
+                ############
+            
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y_true = self.resid_dropout(self.c_proj(y_true.transpose(1, 2).contiguous().view(B, T, C)))
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        if use_att_caching
-            # return y, {'att': att[..., 1:,1:].cpu(), 'v': v[..., 1:, :].cpu(), 'k': k[..., 1:, :].cpu()}
-            return y, {'v': v[..., 1:, :].cpu(), 'k': k[..., 1:, :].cpu()}
+        if use_att_caching:
+            return y, {'v': v[..., 1:, :].cpu(), 'k': k[..., 1:, :].cpu(), 'k_proj': k_proj[..., 1:, :].cpu(), 'y_true': y_true}
         else:
             return y, None
 
@@ -151,9 +172,19 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, att_cache=None, use_att_caching=True):
+        x_true=x
+        # x_orig=x
         attn_output, new_att_cache = self.attn(self.ln_1(x), att_cache=att_cache, use_att_caching=use_att_caching)
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
+        if 'y_true' in new_att_cache and att_cache is not None:
+            x_true = x_true + new_att_cache['y_true']
+            x_true = x_true + self.mlp(self.ln_2(x_true))
+            print('x_true norm: ', x_true.squeeze().norm().item())
+            print('(x-x_true) norm: ', (x-x_true).squeeze().norm().item())
+            # print('(x_orig-x_true) norm: ', (x_orig-x_true).squeeze().norm().item())
+            breakpoint()
+            x=x_true
         return x, new_att_cache
 
 @dataclass
@@ -373,7 +404,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_att_caching=True):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_att_caching=True, decode=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -382,6 +413,12 @@ class GPT(nn.Module):
         if use_att_caching:
             assert idx.size(1) >= self.config.block_size
         att_cache_list = None
+
+        assert idx.size(0) == 1 # Batch size 1 only for now (useful for printing, debugging)
+        if use_att_caching:
+            text_gen = []
+            text_gen.append(decode(idx[0].tolist()))
+
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -399,10 +436,17 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             
-            
             if use_att_caching:
                 idx = idx_next
+                text_gen.append(decode(idx_next[0].tolist()))
+
             else:
                 idx = torch.cat((idx, idx_next), dim=1)
-
+        
+        
+        if not use_att_caching:
+            print(decode(idx[0].tolist()))
+        else:
+            print(" ".join(text_gen))
+        print('---------------')
         return idx
